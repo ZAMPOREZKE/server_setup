@@ -26,13 +26,59 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
+sshd_config_files() {
+  printf '%s\n' "$SSHD_CONFIG"
+  awk '
+    /^[[:space:]]*Include[[:space:]]+/ {
+      for (i = 2; i <= NF; i++) print $i
+    }
+  ' "$SSHD_CONFIG" 2>/dev/null | while IFS= read -r pattern; do
+    [[ -n "$pattern" ]] || continue
+    for path in $pattern; do
+      [[ -f "$path" ]] && printf '%s\n' "$path"
+    done
+  done
+}
+
 current_port() {
-  local port
-  port="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' "$SSHD_CONFIG" || true)"
-  if [[ -z "$port" ]]; then
-    port=22
+  local port=""
+  local file
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    port="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' "$file" || true)"
+    if [[ -n "$port" ]]; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done < <(sshd_config_files)
+  printf '22\n'
+}
+
+check_port_conflicts_in_includes() {
+  local new_port="$1"
+  local file
+  local conflicts=""
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    [[ "$file" == "$SSHD_CONFIG" ]] && continue
+    if awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{exit 0} END{exit 1}' "$file"; then
+      conflicts+="$file "
+    fi
+    if awk '/^[[:space:]]*ListenAddress[[:space:]]+.*:[0-9]+/{exit 0} END{exit 1}' "$file"; then
+      conflicts+="$file "
+    fi
+  done < <(sshd_config_files)
+
+  if awk '/^[[:space:]]*ListenAddress[[:space:]]+.*:[0-9]+/{exit 0} END{exit 1}' "$SSHD_CONFIG"; then
+    log "Warning: ListenAddress with explicit port is set in $SSHD_CONFIG. It may override Port $new_port."
+    log "Review with: grep -nE '^[[:space:]]*ListenAddress' $SSHD_CONFIG"
   fi
-  printf '%s\n' "$port"
+
+  if [[ -n "$conflicts" ]]; then
+    log "Warning: Port or ListenAddress:port directives found in SSH Include files:"
+    log "  $conflicts"
+    log "These may override Port $new_port. Inspect them manually if SSH binds to the wrong port."
+  fi
 }
 
 port_in_use() {
@@ -101,16 +147,20 @@ validate_sshd_config() {
   fi
 }
 
+unit_exists() {
+  systemctl cat "$1" >/dev/null 2>&1
+}
+
 configure_ssh_socket_activation() {
   local socket_unit=""
   local service_unit=""
 
   command -v systemctl >/dev/null 2>&1 || return 0
 
-  if systemctl list-unit-files | grep -q '^ssh\.socket'; then
+  if unit_exists ssh.socket; then
     socket_unit="ssh.socket"
     service_unit="ssh.service"
-  elif systemctl list-unit-files | grep -q '^sshd\.socket'; then
+  elif unit_exists sshd.socket; then
     socket_unit="sshd.socket"
     service_unit="sshd.service"
   else
@@ -121,22 +171,32 @@ configure_ssh_socket_activation() {
      systemctl is-active "$socket_unit" >/dev/null 2>&1; then
     log "Detected socket activation via $socket_unit."
     log "Disabling $socket_unit so SSH port is controlled by $SSHD_CONFIG."
-    systemctl disable --now "$socket_unit"
+    systemctl disable --now "$socket_unit" || true
+    systemctl stop "$socket_unit" 2>/dev/null || true
+    systemctl daemon-reload || true
   fi
 
-  if [[ -n "$service_unit" ]]; then
+  if [[ -n "$service_unit" ]] && unit_exists "$service_unit"; then
     systemctl enable "$service_unit" >/dev/null 2>&1 || true
   fi
 }
 
 reload_ssh_service() {
   if command -v systemctl >/dev/null 2>&1; then
-    if systemctl list-unit-files | grep -q '^sshd\.service'; then
-      systemctl restart sshd
-      return 0
+    local unit=""
+    if unit_exists sshd.service; then
+      unit="sshd"
+    elif unit_exists ssh.service; then
+      unit="ssh"
     fi
-    if systemctl list-unit-files | grep -q '^ssh\.service'; then
-      systemctl restart ssh
+
+    if [[ -n "$unit" ]]; then
+      systemctl stop "$unit" 2>/dev/null || true
+      sleep 1
+      if ! systemctl start "$unit"; then
+        systemctl status "$unit" --no-pager -l || true
+        die "Failed to start $unit. See 'systemctl status $unit' and 'journalctl -u $unit'."
+      fi
       return 0
     fi
   fi
@@ -205,12 +265,35 @@ warn_if_old_port_still_used_by_sshd() {
 
 ensure_new_port_listener() {
   local new_port="$1"
+  local waited=0
+  local max_wait="${NEW_PORT_WAIT_SECONDS:-15}"
 
   command -v ss >/dev/null 2>&1 || return 0
 
-  if ! ss -H -lntp "( sport = :$new_port )" 2>/dev/null | grep -q 'sshd'; then
-    die "New SSH port $new_port is not listening after restart."
+  while (( waited < max_wait )); do
+    if ss -H -lntp "( sport = :$new_port )" 2>/dev/null | grep -q 'sshd'; then
+      return 0
+    fi
+    sleep 1
+    ((waited++))
+  done
+
+  log "New SSH port $new_port is not listening after ${max_wait}s. Diagnostic info follows:"
+  log "--- effective sshd config (Port/ListenAddress) ---"
+  if command -v sshd >/dev/null 2>&1; then
+    sshd -T 2>/dev/null | grep -E '^(port|listenaddress)\b' || true
   fi
+  log "--- ss -lntp (sshd/ssh/systemd listeners) ---"
+  ss -lntp 2>/dev/null | grep -E 'sshd|ssh|systemd' || true
+  log "--- systemctl status (ssh/sshd) ---"
+  if command -v systemctl >/dev/null 2>&1; then
+    for u in ssh.service sshd.service ssh.socket sshd.socket; do
+      if unit_exists "$u"; then
+        systemctl --no-pager -l status "$u" 2>/dev/null | head -n 20 || true
+      fi
+    done
+  fi
+  die "New SSH port $new_port is not listening after restart. See diagnostics above."
 }
 
 print_ssh_listeners() {
@@ -381,6 +464,8 @@ main() {
     cp "$backup" "$SSHD_CONFIG"
     die "sshd_config validation failed. Restored from backup."
   fi
+
+  check_port_conflicts_in_includes "$new_port"
 
   harden_ufw_icmp_rules
   maybe_open_firewall "$new_port" "$old_port"
