@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# stage2_server_setup.sh
+# stage2_server_setup.sh v2.1
 # Safe post-SSH-port-change hardening for Debian/Ubuntu VPS.
+#
+# Fix in v2.1:
+# - Does NOT treat localhost-only sshd listeners like 127.0.0.1:6010 / [::1]:6010 as public SSH ports.
+# - Automatically removes old buggy UFW rules for localhost-only sshd forwarding ports if a previous version added them.
 #
 # What it does:
 # - Ensures /run/sshd exists, so sshd config validation does not fail.
-# - Detects the active SSH port(s) from sshd and live listeners.
+# - Detects public SSH port(s) from sshd config and non-loopback sshd listeners.
 # - Validates SSH config before touching SSH service.
 # - Installs basic admin/security packages.
 # - Enables UFW safely and keeps current SSH + HTTP/HTTPS open.
 # - Optionally removes stale old SSH UFW rules like 22/tcp or previous random ports.
-# - Enables fail2ban for the detected SSH port(s).
+# - Enables fail2ban for the detected public SSH port(s).
 # - Enables unattended security updates.
 # - Applies conservative sysctl network hardening.
 # - Adds conservative SSH hardening that should not lock you out.
@@ -35,7 +39,7 @@ for arg in "$@"; do
   case "$arg" in
     -y|--yes) YES=1 ;;
     -h|--help)
-      sed -n '1,45p' "$0"
+      sed -n '1,55p' "$0"
       exit 0
       ;;
     *)
@@ -151,30 +155,80 @@ reload_ssh_safely() {
   die "Could not detect SSH service manager."
 }
 
-effective_ssh_ports() {
+configured_ssh_ports() {
   ensure_run_sshd
-  local ports=()
 
   if [[ -f "$SSHD_CONFIG" ]]; then
-    while IFS= read -r p; do
-      [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
-    done < <("$(sshd_bin)" -T -f "$SSHD_CONFIG" 2>/dev/null | awk '/^port /{print $2}' || true)
+    "$(sshd_bin)" -T -f "$SSHD_CONFIG" 2>/dev/null \
+      | awk '/^port / && $2 ~ /^[0-9]+$/ {print $2}' \
+      | sort -n -u
   fi
+}
 
-  if have ss; then
-    while IFS= read -r p; do
-      [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
-    done < <(
-      ss -H -ltnp 2>/dev/null \
-        | awk '/users:\(\("sshd"/ {
-            addr=$4
-            sub(/^.*:/, "", addr)
-            if (addr ~ /^[0-9]+$/) print addr
-          }'
-    )
-  fi
+external_sshd_listener_ports() {
+  have ss || return 0
 
-  # Fallback to configured Port lines.
+  # Important:
+  # sshd may create localhost-only listeners such as 127.0.0.1:6010 / [::1]:6010
+  # for X11 forwarding or tunnels. Those are NOT public SSH login ports.
+  # We only keep non-loopback listeners here.
+  ss -H -ltnp 2>/dev/null \
+    | awk '
+        function split_addr_port(s) {
+          bind = s
+          port = s
+
+          if (s ~ /^\[/) {
+            bind = s
+            sub(/^\[/, "", bind)
+            sub(/\]:[0-9]+$/, "", bind)
+
+            port = s
+            sub(/^.*\]:/, "", port)
+          } else {
+            bind = s
+            sub(/:[0-9]+$/, "", bind)
+
+            port = s
+            sub(/^.*:/, "", port)
+          }
+        }
+
+        function is_loopback(a) {
+          return (
+            a == "localhost" ||
+            a ~ /^127\./ ||
+            a == "::1" ||
+            a ~ /^::ffff:127\./
+          )
+        }
+
+        /users:\(\("sshd"/ {
+          split_addr_port($4)
+          if (port ~ /^[0-9]+$/ && !is_loopback(bind)) {
+            print port
+          }
+        }
+      ' \
+    | sort -n -u
+}
+
+effective_ssh_ports() {
+  local ports=()
+
+  # Primary source: effective sshd config.
+  # This avoids confusing sshd child-process forwarding listeners with the real login port.
+  while IFS= read -r p; do
+    [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
+  done < <(configured_ssh_ports || true)
+
+  # Secondary source: public/non-loopback live sshd listeners.
+  # This helps on hosts where systemd socket activation or a custom service is involved.
+  while IFS= read -r p; do
+    [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
+  done < <(external_sshd_listener_ports || true)
+
+  # Fallback to configured Port lines if sshd -T failed for some unexpected reason.
   if [[ ${#ports[@]} -eq 0 && -f "$SSHD_CONFIG" ]]; then
     while IFS= read -r p; do
       [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
@@ -196,16 +250,75 @@ list_sshd_listeners() {
   fi
 }
 
+list_public_sshd_ports() {
+  effective_ssh_ports | paste -sd' ' -
+}
+
 port_is_listening() {
   local port="$1"
   have ss || return 1
   ss -H -ltn "( sport = :$port )" 2>/dev/null | grep -q .
 }
 
-port_is_listened_by_sshd() {
+port_has_only_loopback_sshd_listener() {
   local port="$1"
   have ss || return 1
-  ss -H -ltnp "( sport = :$port )" 2>/dev/null | grep -q 'sshd'
+
+  local result
+  result="$(
+    ss -H -ltnp "( sport = :$port )" 2>/dev/null \
+      | awk '
+          function split_addr_port(s) {
+            bind = s
+            if (s ~ /^\[/) {
+              sub(/^\[/, "", bind)
+              sub(/\]:[0-9]+$/, "", bind)
+            } else {
+              sub(/:[0-9]+$/, "", bind)
+            }
+          }
+
+          function is_loopback(a) {
+            return (
+              a == "localhost" ||
+              a ~ /^127\./ ||
+              a == "::1" ||
+              a ~ /^::ffff:127\./
+            )
+          }
+
+          BEGIN {
+            sshd = 0
+            loopback = 0
+            nonloopback = 0
+            other = 0
+          }
+
+          {
+            if ($0 ~ /users:\(\("sshd"/) {
+              sshd = 1
+              split_addr_port($4)
+              if (is_loopback(bind)) {
+                loopback = 1
+              } else {
+                nonloopback = 1
+              }
+            } else {
+              other = 1
+            }
+          }
+
+          END {
+            if (sshd && loopback && !nonloopback && !other) {
+              print "ONLY_LOOPBACK_SSHD"
+            } else {
+              print "NO"
+            }
+          }
+        '
+  )"
+
+  [[ "$result" == "ONLY_LOOPBACK_SSHD" ]]
 }
 
 install_baseline_packages() {
@@ -263,7 +376,7 @@ configure_ufw() {
 
   local p
   for p in "${ssh_ports[@]}"; do
-    log "Allowing current SSH port: ${p}/tcp"
+    log "Allowing public SSH port: ${p}/tcp"
     ufw allow "${p}/tcp" >/dev/null
   done
 
@@ -304,8 +417,35 @@ in_array() {
   return 1
 }
 
+cleanup_buggy_local_sshd_ufw_rules() {
+  have ufw || return 0
+
+  local keep_ports=()
+  mapfile -t keep_ports < <(effective_ssh_ports)
+
+  [[ "$OPEN_HTTP" -eq 1 ]] && keep_ports+=("80")
+  [[ "$OPEN_HTTPS" -eq 1 ]] && keep_ports+=("443")
+
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    in_array "$p" "${keep_ports[@]}" && continue
+
+    if port_has_only_loopback_sshd_listener "$p"; then
+      log "Removing buggy UFW rule for localhost-only sshd listener: ${p}/tcp"
+      ufw --force delete allow "${p}/tcp" >/dev/null 2>&1 || true
+    fi
+  done < <(ufw_allowed_tcp_ports)
+
+  ufw reload >/dev/null || true
+}
+
 cleanup_stale_ufw_ssh_rules() {
   have ufw || return 0
+
+  # Always clean the previous v2.0 bug automatically:
+  # localhost-only sshd forwarding ports must never be opened publicly.
+  cleanup_buggy_local_sshd_ufw_rules
 
   local keep_ports=()
   mapfile -t keep_ports < <(effective_ssh_ports)
@@ -374,7 +514,7 @@ findtime = 10m
 bantime = 1h
 EOF
 
-  log "Configured fail2ban SSH jail for port(s): ${ssh_ports_csv}"
+  log "Configured fail2ban SSH jail for public port(s): ${ssh_ports_csv}"
 
   if have systemctl; then
     systemctl enable fail2ban >/dev/null 2>&1 || true
@@ -473,7 +613,7 @@ print_summary() {
 
   echo
   echo "================ STAGE 2 COMPLETE ================"
-  echo "SSH port(s): ${ssh_ports}"
+  echo "Public SSH port(s): ${ssh_ports}"
   echo
   echo "SSH listeners:"
   list_sshd_listeners
@@ -505,7 +645,7 @@ main() {
   ensure_run_sshd
   validate_sshd
 
-  log "Detected SSH port(s): $(effective_ssh_ports | paste -sd' ' -)"
+  log "Detected public SSH port(s): $(list_public_sshd_ports)"
   log "Current SSH-related listeners:"
   list_sshd_listeners
 
