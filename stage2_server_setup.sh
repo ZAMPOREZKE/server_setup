@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# stage2_server_setup.sh v2.1
+# stage2_server_setup.sh v2.2
 # Safe post-SSH-port-change hardening for Debian/Ubuntu VPS.
 #
-# Fix in v2.1:
-# - Does NOT treat localhost-only sshd listeners like 127.0.0.1:6010 / [::1]:6010 as public SSH ports.
-# - Automatically removes old buggy UFW rules for localhost-only sshd forwarding ports if a previous version added them.
+# Fix in v2.2:
+# - Fixes awk syntax error caused by multi-line `return (...)` in is_loopback().
+# - Keeps localhost-only sshd listeners like 127.0.0.1:6010 / [::1]:6010 out of public SSH port detection.
+# - Runs a small apt/dpkg preflight before package installation on apt-based systems.
 #
 # What it does:
 # - Ensures /run/sshd exists, so sshd config validation does not fail.
@@ -25,19 +26,21 @@ set -Eeuo pipefail
 #   bash stage2_server_setup.sh --yes
 #
 # Useful env vars:
-#   CLEAN_OLD_SSH_PORTS=1   Remove stale SSH-looking UFW rules without asking.
-#   OPEN_HTTP=1             Keep/open 80/tcp. Default: 1
-#   OPEN_HTTPS=1            Keep/open 443/tcp. Default: 1
-#   INSTALL_PACKAGES=1      Install baseline packages. Default: 1
-#   ENABLE_FAIL2BAN=1       Configure fail2ban. Default: 1
-#   ENABLE_AUTO_UPDATES=1   Configure unattended-upgrades. Default: 1
-#   APPLY_SYSCTL=1          Apply network sysctl hardening. Default: 1
-#   APPLY_SSH_HARDENING=1   Apply conservative sshd hardening. Default: 1
+#   CLEAN_OLD_SSH_PORTS=1     Remove stale SSH-looking UFW rules without asking.
+#   OPEN_HTTP=1               Keep/open 80/tcp. Default: 1
+#   OPEN_HTTPS=1              Keep/open 443/tcp. Default: 1
+#   INSTALL_PACKAGES=1        Install baseline packages. Default: 1
+#   ENABLE_FAIL2BAN=1         Configure fail2ban. Default: 1
+#   ENABLE_AUTO_UPDATES=1     Configure unattended-upgrades. Default: 1
+#   APPLY_SYSCTL=1            Apply network sysctl hardening. Default: 1
+#   APPLY_SSH_HARDENING=1     Apply conservative sshd hardening. Default: 1
 
 YES=0
 for arg in "$@"; do
   case "$arg" in
-    -y|--yes) YES=1 ;;
+    -y|--yes)
+      YES=1
+      ;;
     -h|--help)
       sed -n '1,55p' "$0"
       exit 0
@@ -85,9 +88,12 @@ have() {
 
 confirm() {
   local prompt="$1"
+
   if [[ "$YES" -eq 1 ]]; then
     return 0
   fi
+
+  local ans
   read -r -p "$prompt [y/N]: " ans
   [[ "$ans" =~ ^[Yy]$ ]]
 }
@@ -125,10 +131,12 @@ validate_sshd() {
 
 ssh_service_units() {
   local units=()
+
   if have systemctl; then
     systemctl cat ssh.service >/dev/null 2>&1 && units+=("ssh.service")
     systemctl cat sshd.service >/dev/null 2>&1 && units+=("sshd.service")
   fi
+
   printf '%s\n' "${units[@]}"
 }
 
@@ -147,8 +155,8 @@ reload_ssh_safely() {
 
   if have service; then
     service ssh reload 2>/dev/null || service ssh restart 2>/dev/null || \
-    service sshd reload 2>/dev/null || service sshd restart 2>/dev/null || \
-    die "Could not reload/restart SSH service."
+      service sshd reload 2>/dev/null || service sshd restart 2>/dev/null || \
+      die "Could not reload/restart SSH service."
     return 0
   fi
 
@@ -195,12 +203,7 @@ external_sshd_listener_ports() {
         }
 
         function is_loopback(a) {
-          return (
-            a == "localhost" ||
-            a ~ /^127\./ ||
-            a == "::1" ||
-            a ~ /^::ffff:127\./
-          )
+          return (a == "localhost" || a ~ /^127\./ || a == "::1" || a ~ /^::ffff:127\./)
         }
 
         /users:\(\("sshd"/ {
@@ -256,12 +259,14 @@ list_public_sshd_ports() {
 
 port_is_listening() {
   local port="$1"
+
   have ss || return 1
   ss -H -ltn "( sport = :$port )" 2>/dev/null | grep -q .
 }
 
 port_has_only_loopback_sshd_listener() {
   local port="$1"
+
   have ss || return 1
 
   local result
@@ -270,6 +275,7 @@ port_has_only_loopback_sshd_listener() {
       | awk '
           function split_addr_port(s) {
             bind = s
+
             if (s ~ /^\[/) {
               sub(/^\[/, "", bind)
               sub(/\]:[0-9]+$/, "", bind)
@@ -279,12 +285,7 @@ port_has_only_loopback_sshd_listener() {
           }
 
           function is_loopback(a) {
-            return (
-              a == "localhost" ||
-              a ~ /^127\./ ||
-              a == "::1" ||
-              a ~ /^::ffff:127\./
-            )
+            return (a == "localhost" || a ~ /^127\./ || a == "::1" || a ~ /^::ffff:127\./)
           }
 
           BEGIN {
@@ -298,6 +299,7 @@ port_has_only_loopback_sshd_listener() {
             if ($0 ~ /users:\(\("sshd"/) {
               sshd = 1
               split_addr_port($4)
+
               if (is_loopback(bind)) {
                 loopback = 1
               } else {
@@ -321,6 +323,20 @@ port_has_only_loopback_sshd_listener() {
   [[ "$result" == "ONLY_LOOPBACK_SSHD" ]]
 }
 
+apt_preflight() {
+  have apt-get || return 0
+
+  export DEBIAN_FRONTEND=noninteractive
+
+  if have dpkg; then
+    log "Running dpkg preflight"
+    dpkg --configure -a
+  fi
+
+  log "Fixing apt dependencies if needed"
+  apt-get -f install -y
+}
+
 install_baseline_packages() {
   [[ "$INSTALL_PACKAGES" -eq 1 ]] || return 0
 
@@ -330,8 +346,11 @@ install_baseline_packages() {
   case "$pm" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
+      apt_preflight
+
       log "Updating apt package index"
       apt-get update -y
+
       log "Installing baseline packages"
       apt-get install -y \
         ca-certificates curl wget gnupg lsb-release \
@@ -398,6 +417,7 @@ configure_ufw() {
 
 ufw_allowed_tcp_ports() {
   have ufw || return 0
+
   ufw status 2>/dev/null \
     | awk '
         $1 ~ /^[0-9]+\/tcp$/ && $2 == "ALLOW" {
@@ -409,11 +429,14 @@ ufw_allowed_tcp_ports() {
 }
 
 in_array() {
-  local needle="$1"; shift
+  local needle="$1"
+  shift
+
   local x
   for x in "$@"; do
     [[ "$x" == "$needle" ]] && return 0
   done
+
   return 1
 }
 
@@ -469,6 +492,7 @@ cleanup_stale_ufw_ssh_rules() {
         log "Keeping ${p}/tcp because something is listening on it."
         continue
       fi
+
       candidates+=("$p")
     fi
   done < <(ufw_allowed_tcp_ports)
@@ -494,6 +518,7 @@ cleanup_stale_ufw_ssh_rules() {
 
 configure_fail2ban() {
   [[ "$ENABLE_FAIL2BAN" -eq 1 ]] || return 0
+
   have fail2ban-server || {
     log "fail2ban is not installed; skipping."
     return 0
@@ -508,6 +533,7 @@ configure_fail2ban() {
 [sshd]
 enabled = true
 port = ${ssh_ports_csv}
+filter = sshd
 backend = systemd
 maxretry = 5
 findtime = 10m
@@ -553,29 +579,22 @@ apply_sysctl_hardening() {
   cat > "$SYSCTL_DROPIN" <<'EOF'
 # Conservative network hardening.
 net.ipv4.tcp_syncookies = 1
-
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
-
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_source_route = 0
-
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
-
 net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
-
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
-
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
-
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 EOF
@@ -618,17 +637,21 @@ print_summary() {
   echo "SSH listeners:"
   list_sshd_listeners
   echo
+
   if have ufw; then
     echo "UFW status:"
     ufw status
     echo
   fi
+
   if have fail2ban-client; then
     echo "fail2ban status:"
     fail2ban-client status sshd 2>/dev/null || fail2ban-client status 2>/dev/null || true
     echo
   fi
+
   echo "Test login from a NEW terminal before closing this session:"
+  local p
   for p in ${ssh_ports}; do
     echo "  ssh -p ${p} root@YOUR_SERVER_IP"
   done
@@ -637,7 +660,6 @@ print_summary() {
 
 main() {
   as_root
-
   [[ -f "$SSHD_CONFIG" ]] || die "Missing ${SSHD_CONFIG}"
 
   log "Stage 2 server setup started."
@@ -656,7 +678,6 @@ main() {
   configure_auto_updates
   apply_sysctl_hardening
   apply_ssh_hardening
-
   print_summary
 }
 
